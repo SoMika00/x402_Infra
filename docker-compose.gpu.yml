@@ -1,0 +1,64 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: x402
+      POSTGRES_USER: x402
+      POSTGRES_PASSWORD: x402
+    volumes: [ "pgdata:/var/lib/postgresql/data" ]
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U x402 -d x402" ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  api0:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      USE_GPU: "1"
+      NVIDIA_VISIBLE_DEVICES: "0"
+    gpus: all
+    depends_on:
+      db:
+        condition: service_healthy
+    expose: ["8080"]        # expose interne; plus besoin de publier 8080
+    restart: unless-stopped
+    volumes:
+      - ./:/app
+      - hf:/root/.cache/huggingface
+
+  api1:
+    build:
+      context: .
+    env_file: .env
+    environment:
+      USE_GPU: "1"
+      NVIDIA_VISIBLE_DEVICES: "1"
+    gpus: all
+    depends_on:
+      db:
+        condition: service_healthy
+    expose: ["8080"]        # expose interne
+    restart: unless-stopped
+    volumes:
+      - ./:/app
+      - hf:/root/.cache/huggingface
+
+  gateway:
+    image: nginx:1.27-alpine
+    depends_on:
+      - api0
+      - api1
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  hf:
