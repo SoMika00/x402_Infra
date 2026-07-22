@@ -1,8 +1,9 @@
 import datetime as dt
-from typing import Optional
+import hashlib
+from typing import Optional, List
 
 from sqlalchemy import (
-    Column, Integer, String, DateTime, LargeBinary, Text, UniqueConstraint, select, insert, update
+    Column, Integer, String, DateTime, LargeBinary, Text, UniqueConstraint, select, insert, update, Date
 )
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import declarative_base
@@ -52,6 +53,14 @@ class JobLog(Base):
     gpu_id = Column(String(8), nullable=True)
     batch_size = Column(Integer, nullable=False, default=1)
     ok = Column(Integer, default=1)  # 1/0
+
+class MerkleRoot(Base):
+    __tablename__ = "merkleroot"
+    id = Column(Integer, primary_key=True)
+    date = Column(Date, nullable=False, unique=True)
+    root = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=dt.datetime.utcnow)
+
 
 def get_engine() -> AsyncEngine:
     global _engine
@@ -108,3 +117,20 @@ async def log_job(session: AsyncSession, *, endpoint: str, payer: str, cents: in
         ok=1 if ok else 0,
     ))
     await session.commit()
+
+
+def compute_merkle_root(leaves: List[str]) -> str:
+    """Compute deterministic SHA256 Merkle root from list of hex strings (sorted)."""
+    if not leaves:
+        return ""
+    # sort for determinism
+    level = sorted(leaves)
+    while len(level) > 1:
+        next_level = []
+        for i in range(0, len(level), 2):
+            a = level[i]
+            b = level[i+1] if i+1 < len(level) else a
+            h = hashlib.sha256((a + b).encode()).hexdigest()
+            next_level.append(h)
+        level = next_level
+    return level[0]

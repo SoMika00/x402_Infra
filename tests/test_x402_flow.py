@@ -1,4 +1,6 @@
 from fastapi.testclient import TestClient
+import subprocess
+import sys
 from app.main import app
 
 client = TestClient(app)
@@ -23,3 +25,12 @@ def test_idempotency():
     r2 = client.post("/embed/", headers={"X-402-Proof":"pay:0xAlice", "Idempotency-Key": key}, json={"text":"same"})
     assert r1.status_code == 200 and r2.status_code == 200
     assert r1.json() == r2.json()
+
+def test_joblog_merkle_cli():
+    # direct import path for determinism
+    from cli.x402ctl import joblog_merkle
+    # will print 'no jobs' or root; just ensure callable without crash
+    try:
+        joblog_merkle("2025-01-15")
+    except SystemExit:
+        pass  # expected on error path

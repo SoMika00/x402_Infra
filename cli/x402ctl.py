@@ -1,9 +1,10 @@
 import asyncio
+import datetime as dt
 import typer
 from typing import Optional
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy import select, desc
-from app.payments.ledger import get_engine, init_db, Buyer, credit_min_pay, JobLog
+from app.payments.ledger import get_engine, init_db, Buyer, credit_min_pay, JobLog, MerkleRoot, compute_merkle_root
 
 app = typer.Typer(help="x402 control CLI")
 
@@ -76,9 +77,9 @@ def joblog_list(
                     str(getattr(r, "created_at", "")),
                     getattr(r, "endpoint", ""),
                     getattr(r, "payer", ""),
-                    str(getattr(r, "cents", "")),
+                    str(getattr(r, "cents", ""),
                     getattr(r, "tx_hash", ""),
-                    str(getattr(r, "latency_ms", "")),
+                    str(getattr(r, "latency_ms", ""),
                     getattr(r, "gpu_id", "") or "",
                 ]
                 typer.echo(" | ".join(vals))
@@ -87,6 +88,42 @@ def joblog_list(
             typer.echo(f"Error: {e}", err=True)
             raise typer.Exit(code=1)
     asyncio.run(_run())
+
+
+@app.command("joblog-merkle")
+def joblog_merkle(date: str):
+    """Compute daily Merkle root for JobLog entries on YYYY-MM-DD."""
+    async def _run():
+        try:
+            d = dt.datetime.strptime(date, "%Y-%m-%d").date()
+            async with async_sessionmaker(get_engine(), expire_on_commit=False)() as session:
+                res = await session.execute(
+                    select(JobLog).where(
+                        JobLog.created_at >= dt.datetime(d.year, d.month, d.day),
+                        JobLog.created_at < dt.datetime(d.year, d.month, d.day) + dt.timedelta(days=1)
+                    ).order_by(JobLog.id)
+                )
+                jobs = res.scalars().all()
+                if not jobs:
+                    typer.echo("no jobs")
+                    return
+                leaves = []
+                for j in jobs:
+                    # deterministic leaf: id|endpoint|payer|cents|tx_hash
+                    leaf = f"{j.id}|{j.endpoint}|{j.payer}|{j.cents}|{j.tx_hash}"
+                    leaves.append(hashlib.sha256(leaf.encode()).hexdigest())
+                root = compute_merkle_root(leaves)
+                # optionally persist
+                await session.execute(
+                    insert(MerkleRoot).values(date=d, root=root).prefix_with("OR IGNORE")
+                )
+                await session.commit()
+                typer.echo(root)
+        except Exception as e:
+            typer.echo(f"Error: {e}", err=True)
+            raise typer.Exit(code=1)
+    asyncio.run(_run())
+
 
 if __name__ == "__main__":
     app()
