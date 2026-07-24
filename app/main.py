@@ -34,6 +34,7 @@ from app.endpoints.embed_batch import router as embed_batch_router
 from app.endpoints.embed_fast import router as embed_fast_router
 from app.endpoints.parse_pdf import router as parse_router
 from app.endpoints.debug_ai import router as debug_ai_router
+from app.endpoints.audit import router as audit_router
 
 Instrumentator().instrument(app).expose(app)
 
@@ -43,6 +44,7 @@ app.include_router(embed_batch_router, tags=["embed"])
 app.include_router(embed_fast_router, tags=["embed"])
 app.include_router(parse_router,  tags=["parse"])
 app.include_router(debug_ai_router, tags=["debug"])
+app.include_router(audit_router, tags=["audit"])
 
 from app.payments.ledger import init_db
 from app.ai.models import get_embedder

@@ -34,3 +34,11 @@ def test_joblog_merkle_cli():
         joblog_merkle("2025-01-15")
     except SystemExit:
         pass  # expected on error path
+
+def test_audit_merkle_endpoint():
+    # 402 first
+    r1 = client.get("/audit/merkle/2025-01-15")
+    assert r1.status_code == 402
+    # 200 with stub (no row -> 404 after pay)
+    r2 = client.get("/audit/merkle/2025-01-15", headers={"X-402-Proof":"pay:0xAuditor"})
+    assert r2.status_code == 404
