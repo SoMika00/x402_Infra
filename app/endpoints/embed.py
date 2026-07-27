@@ -6,6 +6,11 @@ from app.ai.models import embed_any
 from app.metrics import latency_seconds
 import os, time
 
+try:
+    from app.ai.mbatcher import get_text_embed_batcher
+except Exception:
+    get_text_embed_batcher = None
+
 router = APIRouter(prefix="/embed")
 
 class EmbedIn(BaseModel):
@@ -26,7 +31,14 @@ _OUTPUT_SCHEMA = {
 async def embed(body: EmbedIn, request: Request,
                 _paid=Depends(pay_dep(settings.PRICE_EMBED_CENTS, endpoint_label="embed", output_schema=_OUTPUT_SCHEMA))):
     t0 = time.perf_counter()
-    vec = embed_any(body.text)[0].tolist()
+    if get_text_embed_batcher:
+        try:
+            batcher = await get_text_embed_batcher()
+            vec = await batcher.embed_one(body.text)
+        except Exception:
+            vec = embed_any(body.text)[0].tolist()
+    else:
+        vec = embed_any(body.text)[0].tolist()
     dt = time.perf_counter() - t0
     latency_seconds.labels("embed").observe(dt)
 
