@@ -8,6 +8,7 @@ from app.middleware.idempotency import IdempotencyMiddleware
 from app.middleware.ratelimit import RateLimitMiddleware
 from app.middleware.payment_response import PaymentResponseMiddleware
 from app.core.config import settings
+from app.core.logging import setup_logging
 
 try:
     from app.metrics import start_gpu_polling
@@ -51,6 +52,7 @@ from app.ai.models import get_embedder
 
 @app.on_event("startup")
 async def startup_event():
+    setup_logging(settings.LOG_LEVEL)
     attempts = int(os.getenv("DB_INIT_RETRIES", "30"))
     delay = float(os.getenv("DB_INIT_DELAY", "1.0"))
     for i in range(1, attempts + 1):
