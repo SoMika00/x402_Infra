@@ -25,6 +25,7 @@ class Settings:
     PRICE_PARSE_PDF_CENTS: int = int(os.getenv("PRICE_PARSE_PDF_CENTS", "1"))
     PRICE_EMBED_CENTS: int = int(os.getenv("PRICE_EMBED_CENTS", "1"))
     PRICE_EMBED_BATCH_CENTS: int = int(os.getenv("PRICE_EMBED_BATCH_CENTS", "5"))
+    PRICE_BALANCE_CENTS: int = int(os.getenv("PRICE_BALANCE_CENTS", "0"))
 
     # AI / batching
     EMBED_BATCH: int = int(os.getenv("EMBED_BATCH", "64"))

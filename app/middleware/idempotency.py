@@ -28,7 +28,7 @@ async def _restore_body(request: Request, body: bytes):
 class IdempotencyMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         key = request.headers.get("Idempotency-Key")
-        if not key or request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        if not key or request.method not in ("GET", "POST", "PUT", "PATCH", "DELETE"):
             return await call_next(request)
 
         # 1) Lire le body une fois

@@ -26,6 +26,14 @@ def test_idempotency():
     assert r1.status_code == 200 and r2.status_code == 200
     assert r1.json() == r2.json()
 
+def test_buyer_balance():
+    r1 = client.get("/buyer/balance")
+    assert r1.status_code == 402
+    r2 = client.get("/buyer/balance", headers={"X-402-Proof":"pay:0xAlice"})
+    assert r2.status_code == 200
+    data = r2.json()
+    assert "address" in data and "balance_cents" in data and "last_tx" in data
+
 def test_joblog_merkle_cli():
     # direct import path for determinism
     from cli.x402ctl import joblog_merkle
