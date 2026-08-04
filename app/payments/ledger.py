@@ -3,7 +3,7 @@ import hashlib
 from typing import Optional, List
 
 from sqlalchemy import (
-    Column, Integer, String, DateTime, LargeBinary, Text, UniqueConstraint, select, insert, update, Date
+    Column, Integer, String, DateTime, LargeBinary, Text, UniqueConstraint, select, insert, update, Date, desc
 )
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.orm import declarative_base
@@ -117,6 +117,12 @@ async def log_job(session: AsyncSession, *, endpoint: str, payer: str, cents: in
         ok=1 if ok else 0,
     ))
     await session.commit()
+
+
+async def list_jobs_for_payer(session: AsyncSession, payer: str, limit: int = 20) -> List[JobLog]:
+    q = select(JobLog).where(JobLog.payer == payer).order_by(desc(JobLog.created_at)).limit(limit)
+    res = await session.execute(q)
+    return res.scalars().all()
 
 
 def compute_merkle_root(leaves: List[str]) -> str:

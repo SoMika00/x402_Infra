@@ -34,6 +34,18 @@ def test_buyer_balance():
     data = r2.json()
     assert "address" in data and "balance_cents" in data and "last_tx" in data
 
+def test_buyer_jobs():
+    # 402 without proof
+    r1 = client.get("/buyer/jobs")
+    assert r1.status_code == 402
+    # 200 with stub, list (may be empty)
+    r2 = client.get("/buyer/jobs", headers={"X-402-Proof":"pay:0xAlice"})
+    assert r2.status_code == 200
+    assert isinstance(r2.json(), list)
+    # with limit
+    r3 = client.get("/buyer/jobs?limit=5", headers={"X-402-Proof":"pay:0xAlice"})
+    assert r3.status_code == 200
+
 def test_joblog_merkle_cli():
     # direct import path for determinism
     from cli.x402ctl import joblog_merkle
