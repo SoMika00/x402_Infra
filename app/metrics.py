@@ -1,12 +1,16 @@
 # app/metrics.py
 from prometheus_client import Counter, Histogram, Gauge
-import threading, time
+import threading, time, asyncio, datetime as dt
+from sqlalchemy.ext.asyncio import async_sessionmaker
+from sqlalchemy import select, func
 
 # NVML (télémétrie GPU) – import optionnel
 try:
     import pynvml  # fourni par le paquet PyPI "nvidia-ml-py3" ou "nvidia-ml-py"
 except Exception:
     pynvml = None
+
+from app.payments.ledger import get_engine, JobLog
 
 # € facturés (déjà consommé par ton code)
 revenue_cents_total = Counter(
@@ -26,6 +30,14 @@ latency_seconds = Histogram(
 gpu_util_pct = Gauge("x402_gpu_util_pct", "GPU utilization percent", labelnames=("gpu",))
 gpu_mem_used = Gauge("x402_gpu_mem_used_bytes", "GPU memory used", labelnames=("gpu",))
 gpu_mem_total = Gauge("x402_gpu_mem_total_bytes", "GPU memory total", labelnames=("gpu",))
+
+# new: jobs gauge per endpoint/payer last 24h
+jobs_total = Gauge(
+    "x402_jobs_total",
+    "Count of JobLog entries per endpoint and payer over last 24h",
+    labelnames=("endpoint", "payer"),
+)
+
 
 def start_gpu_polling(period: float = 5.0):
     """
@@ -51,6 +63,37 @@ def start_gpu_polling(period: float = 5.0):
         except Exception:
             # on garde silencieux pour ne pas casser l'app si NVML bug
             pass
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+
+
+async def _update_jobs():
+    engine = get_engine()
+    async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+        since = dt.datetime.utcnow() - dt.timedelta(hours=24)
+        q = (
+            select(JobLog.endpoint, JobLog.payer, func.count())
+            .where(JobLog.created_at >= since)
+            .group_by(JobLog.endpoint, JobLog.payer)
+        )
+        res = await session.execute(q)
+        for row in res.all():
+            endpoint, payer, cnt = row
+            jobs_total.labels(endpoint=endpoint, payer=payer).set(cnt)
+
+
+def start_job_polling(period: float = 60.0):
+    """
+    Background thread polling JobLog counts (last 24h) every N seconds, like GPU.
+    """
+    def _loop():
+        while True:
+            try:
+                asyncio.run(_update_jobs())
+            except Exception:
+                pass
+            time.sleep(period)
 
     t = threading.Thread(target=_loop, daemon=True)
     t.start()

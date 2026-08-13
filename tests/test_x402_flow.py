@@ -101,3 +101,15 @@ def test_parse_pdf_creates_joblog():
     assert rj.status_code == 200
     jobs = rj.json()
     assert any(j.get("endpoint") == "parse_pdf" for j in jobs)
+
+
+def test_metrics_jobs_gauge():
+    # seed a job
+    files = {"file": ("test.pdf", BytesIO(b"%PDF-1.4 fake"), "application/pdf")}
+    r = client.post("/parse/pdf", headers={"X-402-Proof":"pay:0xMetrics"}, files=files)
+    assert r.status_code == 200
+    # hit /metrics (exposed by instrumentator)
+    rm = client.get("/metrics")
+    assert rm.status_code == 200
+    assert "x402_jobs_total" in rm.text
+    assert 'endpoint="parse_pdf"' in rm.text or 'endpoint="parse_pdf"' in rm.text

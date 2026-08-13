@@ -11,9 +11,10 @@ from app.core.config import settings
 from app.core.logging import setup_logging
 
 try:
-    from app.metrics import start_gpu_polling
+    from app.metrics import start_gpu_polling, start_job_polling
 except Exception:
     start_gpu_polling = None
+    start_job_polling = None
 
 app = FastAPI(title="x402 API", version="0.1.5")
 
@@ -72,5 +73,11 @@ async def startup_event():
     if start_gpu_polling:
         try:
             start_gpu_polling(period=5.0)
+        except Exception:
+            pass
+
+    if start_job_polling:
+        try:
+            start_job_polling(period=60.0)
         except Exception:
             pass
