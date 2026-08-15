@@ -113,3 +113,22 @@ def test_metrics_jobs_gauge():
     assert rm.status_code == 200
     assert "x402_jobs_total" in rm.text
     assert 'endpoint="parse_pdf"' in rm.text or 'endpoint="parse_pdf"' in rm.text
+
+
+def test_parse_pdf_batch_402_then_200():
+    # 402 without payment
+    files = [("files", ("a.pdf", BytesIO(b"%PDF-1.4 fakeA"), "application/pdf")),
+             ("files", ("b.pdf", BytesIO(b"%PDF-1.4 fakeB"), "application/pdf"))]
+    r1 = client.post("/parse/pdf/batch", files=files)
+    assert r1.status_code == 402
+
+    # 200 with stub proof
+    files = [("files", ("a.pdf", BytesIO(b"%PDF-1.4 fakeA"), "application/pdf")),
+             ("files", ("b.pdf", BytesIO(b"%PDF-1.4 fakeB"), "application/pdf"))]
+    r2 = client.post("/parse/pdf/batch", headers={"X-402-Proof":"pay:0xAlice"}, files=files)
+    assert r2.status_code == 200
+    data = r2.json()
+    assert data.get("ok") is True
+    assert "results" in data
+    assert len(data["results"]) == 2
+    assert "X-PAYMENT-RESPONSE" in r2.headers
