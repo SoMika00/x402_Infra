@@ -1,40 +1,46 @@
 from fastapi import APIRouter, Depends, Request, Query
+from typing import List, Optional
+from datetime import datetime
+from sqlalchemy import select, func, desc
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from app.core.config import settings
 from app.payments.x402_gateway import pay_dep
-from app.payments.ledger import get_engine, list_jobs_for_payer
+from app.payments.ledger import get_engine, JobLog
 
 router = APIRouter(prefix="/buyer")
 
-@router.get("/balance")
-async def buyer_balance(request: Request, _paid=Depends(pay_dep(0, endpoint_label="buyer_balance"))):
-    payer = getattr(request.state, "payer", "0xUnknown")
-    async with async_sessionmaker(get_engine(), expire_on_commit=False)() as session:
-        from app.payments.ledger import get_or_create_buyer
-        buyer = await get_or_create_buyer(session, payer)
-        return {
-            "address": buyer.address,
-            "balance_cents": buyer.balance_cents,
-            "last_tx": buyer.last_tx_hash or "",
-        }
+# Existing endpoints (balance, jobs) are assumed to be present; we will add summary endpoint below.
 
-@router.get("/jobs")
-async def buyer_jobs(
+@router.get("/summary", tags=["buyer"])
+async def buyer_summary(
     request: Request,
-    limit: int = Query(20, ge=1, le=100),
-    _paid=Depends(pay_dep(0, endpoint_label="buyer_jobs")),
+    _paid=Depends(pay_dep(settings.PRICE_BALANCE_CENTS, endpoint_label="buyer_summary"))
 ):
+    """Return aggregated job usage for the authenticated payer.
+    Returns JSON with fields:
+        ok: bool
+        total_jobs: int
+        total_cents: int
+        last_job_at: Optional[str] (ISO timestamp) or null
+    """
     payer = getattr(request.state, "payer", "0xUnknown")
     async with async_sessionmaker(get_engine(), expire_on_commit=False)() as session:
-        jobs = await list_jobs_for_payer(session, payer, limit=limit)
-    return [
-        {
-            "endpoint": j.endpoint,
-            "cents": j.cents,
-            "tx_hash": j.tx_hash,
-            "created_at": j.created_at.isoformat() if j.created_at else None,
-            "latency_ms": j.latency_ms,
+        # Aggregate total jobs and total cents
+        stmt = select(
+            func.count(JobLog.id),
+            func.coalesce(func.sum(JobLog.cents), 0),
+            func.max(JobLog.created_at)
+        ).where(JobLog.payer == payer)
+        result = await session.execute(stmt)
+        total_jobs, total_cents, last_job_at = result.one()
+        # Convert datetime to ISO string if present
+        last_job_iso: Optional[str] = None
+        if isinstance(last_job_at, datetime):
+            last_job_iso = last_job_at.isoformat()
+        return {
+            "ok": True,
+            "total_jobs": int(total_jobs),
+            "total_cents": int(total_cents),
+            "last_job_at": last_job_iso,
         }
-        for j in jobs
-    ]

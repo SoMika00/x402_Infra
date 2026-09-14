@@ -48,6 +48,27 @@ def test_buyer_jobs():
     r3 = client.get("/buyer/jobs?limit=5", headers={"X-402-Proof":"pay:0xAlice"})
     assert r3.status_code == 200
 
+def test_buyer_summary_no_jobs():
+    # Ensure a fresh payer with no jobs
+    r = client.get("/buyer/summary", headers={"X-402-Proof":"pay:0xNewUser"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["ok"] is True
+    assert data["total_jobs"] == 0
+    assert data["total_cents"] == 0
+    assert data["last_job_at"] is None
+
+def test_buyer_summary_with_jobs():
+    # Create a job via embed endpoint
+    client.post("/embed/", headers={"X-402-Proof":"pay:0xBob"}, json={"text":"test"})
+    # Retrieve summary
+    r = client.get("/buyer/summary", headers={"X-402-Proof":"pay:0xBob"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["total_jobs"] >= 1
+    assert data["total_cents"] >= settings.PRICE_EMBED_CENTS
+    assert data["last_job_at"] is not None
+
 def test_joblog_merkle_cli():
     # direct import path for determinism
     from cli.x402ctl import joblog_merkle
@@ -65,7 +86,6 @@ def test_audit_merkle_endpoint():
     r2 = client.get("/audit/merkle/2025-01-15", headers={"X-402-Proof":"pay:0xAuditor"})
     assert r2.status_code == 404
 
-
 def test_parse_pdf_402_then_200():
     # 402 without payment
     files = {"file": ("test.pdf", BytesIO(b"%PDF-1.4 fake"), "application/pdf")}
@@ -81,7 +101,6 @@ def test_parse_pdf_402_then_200():
     assert "text" in data or "pages" in data
     assert "X-PAYMENT-RESPONSE" in r2.headers
 
-
 def test_parse_pdf_idempotency():
     key = "pdf-key-456"
     files = {"file": ("test.pdf", BytesIO(b"%PDF-1.4 fake"), "application/pdf")}
@@ -90,7 +109,6 @@ def test_parse_pdf_idempotency():
     r2 = client.post("/parse/pdf", headers={"X-402-Proof":"pay:0xAlice", "Idempotency-Key": key}, files=files)
     assert r1.status_code == 200 and r2.status_code == 200
     assert r1.json() == r2.json()
-
 
 def test_parse_pdf_creates_joblog():
     files = {"file": ("test.pdf", BytesIO(b"%PDF-1.4 fake"), "application/pdf")}
@@ -102,7 +120,6 @@ def test_parse_pdf_creates_joblog():
     jobs = rj.json()
     assert any(j.get("endpoint") == "parse_pdf" for j in jobs)
 
-
 def test_metrics_jobs_gauge():
     # seed a job
     files = {"file": ("test.pdf", BytesIO(b"%PDF-1.4 fake"), "application/pdf")}
@@ -113,7 +130,6 @@ def test_metrics_jobs_gauge():
     assert rm.status_code == 200
     assert "x402_jobs_total" in rm.text
     assert 'endpoint="parse_pdf"' in rm.text or 'endpoint="parse_pdf"' in rm.text
-
 
 def test_parse_pdf_batch_402_then_200():
     # 402 without payment
