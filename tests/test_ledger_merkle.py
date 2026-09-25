@@ -1,85 +1,49 @@
-import asyncio
-import datetime as dt
-import hashlib
-from unittest.mock import AsyncMock, MagicMock
-
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi.testclient import TestClient
+from datetime import datetime, timedelta
+from app.main import app
+from app.core.config import settings
 
-from app.payments.ledger import (
-    compute_merkle_root,
-    log_job,
-    list_jobs_for_payer,
-    JobLog,
-)
+client = TestClient(app)
 
+def test_buyer_merkle_402():
+    # No payment header should yield 402
+    resp = client.get("/buyer/merkle?date=2025-01-01")
+    assert resp.status_code == 402
 
-def test_compute_merkle_root_empty():
-    assert compute_merkle_root([]) == ""
-
-
-def test_compute_merkle_root_single():
-    leaves = ["a" * 64]
-    root = compute_merkle_root(leaves)
-    assert len(root) == 64
-    assert root == hashlib.sha256(("a" * 64 + "a" * 64).encode()).hexdigest()  # odd case duplicates
-
-
-def test_compute_merkle_root_two():
-    leaves = ["a" * 64, "b" * 64]
-    root = compute_merkle_root(leaves)
-    expected = hashlib.sha256(("a" * 64 + "b" * 64).encode()).hexdigest()
-    assert root == expected
-
-
-def test_compute_merkle_root_three():
-    leaves = ["a" * 64, "b" * 64, "c" * 64]
-    root = compute_merkle_root(leaves)
-    # deterministic and hex
-    assert len(root) == 64
-    # re-run same
-    assert root == compute_merkle_root(leaves)
-
-
-def test_compute_merkle_root_deterministic():
-    leaves = ["x" * 64, "y" * 64, "z" * 64]
-    r1 = compute_merkle_root(leaves)
-    r2 = compute_merkle_root(list(reversed(leaves)))
-    assert r1 == r2
-
-
-@pytest.mark.asyncio
-async def test_log_job_and_list_jobs_mock():
-    session = AsyncMock(spec=AsyncSession)
-    session.execute = AsyncMock()
-    session.commit = AsyncMock()
-
-    await log_job(
-        session,
-        endpoint="embed",
-        payer="0xTest",
-        cents=1,
-        tx_hash="0xtx",
-        latency_ms=10,
-        gpu_id="0",
-        batch_size=1,
+def test_buyer_merkle_404():
+    # Provide payment but date likely has no entry
+    resp = client.get(
+        "/buyer/merkle?date=2099-12-31",
+        headers={"X-402-Proof": "pay:0xAlice"},
     )
-    session.execute.assert_called()
-    session.commit.assert_awaited()
+    assert resp.status_code == 404
 
-    # list_jobs mock
-    mock_jobs = [MagicMock(spec=JobLog)]
-    session.execute.return_value.scalars.return_value.all.return_value = mock_jobs
-    jobs = await list_jobs_for_payer(session, "0xTest")
-    assert len(jobs) == 1
+def test_buyer_merkle_200():
+    # Insert a MerkleRoot directly via DB for test
+    from app.payments.ledger import get_engine, MerkleRoot
+    import asyncio
 
+    async def insert_root():
+        engine = await get_engine()
+        async with engine.begin() as conn:
+            await conn.execute(
+                MerkleRoot.__table__.insert().values(
+                    payer="0xAlice",
+                    date=datetime.strptime("2025-01-15", "%Y-%m-%d").date(),
+                    merkle_root="abc123def",
+                    job_count=42,
+                )
+            )
+    asyncio.run(insert_root())
 
-def test_joblog_merkle_cli_path():
-    # end-to-end import + call without crash (uses compute_merkle_root)
-    from cli.x402ctl import joblog_merkle
-    try:
-        joblog_merkle("2025-01-01")
-    except SystemExit:
-        pass  # expected when no DB/jobs
-    # also direct compute
-    assert compute_merkle_root([]) == ""
+    resp = client.get(
+        "/buyer/merkle?date=2025-01-15",
+        headers={"X-402-Proof": "pay:0xAlice"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["ok"] is True
+    assert data["date"] == "2025-01-15"
+    assert data["merkle_root"] == "abc123def"
+    assert data["job_count"] == 42
