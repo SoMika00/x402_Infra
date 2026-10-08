@@ -1,4 +1,5 @@
 import datetime as dt
+import hashlib
 import json
 from typing import Optional, List
 
@@ -107,3 +108,84 @@ async def get_job_summary(session: AsyncSession, payer: str) -> dict:
         "total_cents": total_cents or 0,
         "last_job_at": last_at.isoformat() if last_at else None,
     }
+
+
+def job_leaf(job) -> str:
+    """Deterministic leaf string for a JobLog row: id|endpoint|payer|cents|tx_hash."""
+    return f"{job.id}|{job.endpoint}|{job.payer}|{job.cents}|{job.tx_hash}"
+
+
+def hash_leaf(leaf: str) -> str:
+    """sha256 hex digest of a leaf string."""
+    return hashlib.sha256(leaf.encode()).hexdigest()
+
+
+def compute_merkle_root(leaves: List[str]) -> str:
+    """Compute the Merkle root for a list of leaf hashes (hex strings).
+
+    Leaves are already hashed (hex digests). The tree is built bottom-up,
+    pairing adjacent nodes; an odd node is promoted to the next level.
+    """
+    if not leaves:
+        return hashlib.sha256(b"").hexdigest()
+    level = list(leaves)
+    while len(level) > 1:
+        next_level = []
+        for i in range(0, len(level), 2):
+            left = level[i]
+            right = level[i + 1] if i + 1 < len(level) else left
+            next_level.append(hashlib.sha256((left + right).encode()).hexdigest())
+        level = next_level
+    return level[0]
+
+
+def compute_merkle_proof(leaves: List[str], index: int) -> List[dict]:
+    """Compute a Merkle proof for the leaf at ``index`` in ``leaves``.
+
+    ``leaves`` is a list of leaf hashes (hex strings). Returns a list of
+    ``{"hash": str, "position": "left"|"right"}`` entries, ordered from the
+    leaf level up to the root. ``position`` indicates where the sibling sits
+    relative to the current node when hashing (left sibling is concatenated
+    first).
+    """
+    if not leaves:
+        return []
+    if index < 0 or index >= len(leaves):
+        raise IndexError("leaf index out of range")
+
+    proof = []
+    level = list(leaves)
+    idx = index
+    while len(level) > 1:
+        next_level = []
+        for i in range(0, len(level), 2):
+            left = level[i]
+            right = level[i + 1] if i + 1 < len(level) else left
+            if i == idx:
+                # current node is the left child; sibling is right
+                proof.append({"hash": right, "position": "right"})
+                idx = len(next_level)
+            elif i + 1 == idx:
+                # current node is the right child; sibling is left
+                proof.append({"hash": left, "position": "left"})
+                idx = len(next_level)
+            next_level.append(hashlib.sha256((left + right).encode()).hexdigest())
+        level = next_level
+    return proof
+
+
+def verify_merkle_proof(leaf: str, proof: List[dict], root: str) -> bool:
+    """Recompute the root from ``leaf`` (hex digest) and ``proof`` and compare.
+
+    ``proof`` is a list of ``{"hash": str, "position": "left"|"right"}``
+    entries ordered from the leaf level upward.
+    """
+    current = leaf
+    for entry in proof:
+        sibling = entry["hash"]
+        position = entry["position"]
+        if position == "left":
+            current = hashlib.sha256((sibling + current).encode()).hexdigest()
+        else:
+            current = hashlib.sha256((current + sibling).encode()).hexdigest()
+    return current == root
