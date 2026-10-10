@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, Request, HTTPException, Query
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy import select
 from app.core.config import settings
@@ -156,7 +156,7 @@ async def verify_merkle(
 
         # Rebuild ordered leaf list for this payer+date (order by JobLog.id)
         day_start = datetime(query_date.year, query_date.month, query_date.day)
-        day_end = day_start + __import__("datetime").timedelta(days=1)
+        day_end = day_start + timedelta(days=1)
         jobs_res = await session.execute(
             select(JobLog)
             .where(
@@ -204,4 +204,109 @@ async def verify_merkle(
         "proof": proof,
         "root": stored_root,
         "verified": verified,
+    }
+
+
+@router.get("/merkle/proof")
+async def get_merkle_proof(
+    request: Request,
+    date: str = Query(..., description="Date in YYYY-MM-DD format"),
+    job_id: int = Query(..., description="JobLog id to prove"),
+    _paid=Depends(pay_dep(settings.PRICE_BALANCE_CENTS, endpoint_label="buyer_merkle_proof"))
+):
+    """Return the Merkle proof for a specific job on a given date.
+
+    Returns {ok, date, job_id, leaf, proof, root}.
+    """
+    # Validate date format
+    try:
+        query_date = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format, expected YYYY-MM-DD")
+
+    payer = getattr(request.state, "payer", "0xUnknown")
+    t0 = time.perf_counter()
+
+    async with async_sessionmaker(get_engine(), expire_on_commit=False)() as session:
+        # Load the JobLog row by id
+        job_res = await session.execute(select(JobLog).where(JobLog.id == job_id))
+        job = job_res.scalar_one_or_none()
+        if job is None:
+            gpu = os.getenv("NVIDIA_VISIBLE_DEVICES", "unknown")
+            await log_job(
+                session,
+                endpoint="buyer_merkle_proof",
+                payer=payer,
+                cents=settings.PRICE_BALANCE_CENTS,
+                tx_hash=getattr(request.state, "tx_hash", "0xunknown"),
+                latency_ms=int((time.perf_counter() - t0) * 1000),
+                gpu_id=gpu,
+                batch_size=1,
+            )
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        if job.payer != payer:
+            raise HTTPException(status_code=403, detail="Job does not belong to the authenticated payer")
+
+        # Rebuild ordered leaf list for this payer+date (order by creation time)
+        day_start = datetime(query_date.year, query_date.month, query_date.day)
+        day_end = day_start + timedelta(days=1)
+        jobs_res = await session.execute(
+            select(JobLog)
+            .where(
+                JobLog.payer == payer,
+                JobLog.created_at >= day_start,
+                JobLog.created_at < day_end,
+            )
+            .order_by(JobLog.created_at, JobLog.id)
+        )
+        jobs = jobs_res.scalars().all()
+
+        leaves = [hash_leaf(job_leaf(j)) for j in jobs]
+        try:
+            target_index = leaves.index(hash_leaf(job_leaf(job)))
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Job not found for the given date")
+
+        proof = compute_merkle_proof(leaves, target_index)
+        leaf_hash = leaves[target_index]
+
+        # Determine the root: prefer stored MerkleRoot, otherwise compute on-the-fly
+        root_res = await session.execute(
+            select(MerkleRoot).where(
+                MerkleRoot.c.payer == payer,
+                MerkleRoot.c.date == query_date,
+            )
+        )
+        root_row = root_res.fetchone()
+        if root_row:
+            root = root_row["merkle_root"]
+        else:
+            from app.payments.ledger import compute_merkle_root
+            root = compute_merkle_root(leaves)
+
+    dt = time.perf_counter() - t0
+    latency_seconds.labels("buyer_merkle_proof").observe(dt)
+
+    # Log successful job
+    async with async_sessionmaker(get_engine(), expire_on_commit=False)() as session:
+        gpu = os.getenv("NVIDIA_VISIBLE_DEVICES", "unknown")
+        await log_job(
+            session,
+            endpoint="buyer_merkle_proof",
+            payer=payer,
+            cents=settings.PRICE_BALANCE_CENTS,
+            tx_hash=getattr(request.state, "tx_hash", "0xunknown"),
+            latency_ms=int(dt * 1000),
+            gpu_id=gpu,
+            batch_size=1,
+        )
+
+    return {
+        "ok": True,
+        "date": date,
+        "job_id": job_id,
+        "leaf": leaf_hash,
+        "proof": proof,
+        "root": root,
     }
