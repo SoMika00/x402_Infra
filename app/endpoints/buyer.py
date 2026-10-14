@@ -12,6 +12,7 @@ from app.payments.ledger import (
     JobLog,
     job_leaf,
     hash_leaf,
+    compute_merkle_root,
     compute_merkle_proof,
     verify_merkle_proof,
 )
@@ -309,4 +310,118 @@ async def get_merkle_proof(
         "leaf": leaf_hash,
         "proof": proof,
         "root": root,
+    }
+
+
+@router.get("/merkle/export")
+async def export_merkle(
+    request: Request,
+    date: str = Query(..., description="Date in YYYY-MM-DD format"),
+    _paid=Depends(pay_dep(settings.PRICE_BALANCE_CENTS, endpoint_label="buyer_merkle_export"))
+):
+    """Return a self-contained, verifiable daily audit bundle for the authenticated payer.
+
+    Returns {ok, version, date, payer, root, leaf_count, jobs, generated_at, verified}.
+    """
+    # Validate date format
+    try:
+        query_date = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format, expected YYYY-MM-DD")
+
+    payer = getattr(request.state, "payer", "0xUnknown")
+    t0 = time.perf_counter()
+
+    async with async_sessionmaker(get_engine(), expire_on_commit=False)() as session:
+        # Build ordered leaf list for this payer+date (order by JobLog.id)
+        day_start = datetime(query_date.year, query_date.month, query_date.day)
+        day_end = day_start + timedelta(days=1)
+        jobs_res = await session.execute(
+            select(JobLog)
+            .where(
+                JobLog.payer == payer,
+                JobLog.created_at >= day_start,
+                JobLog.created_at < day_end,
+            )
+            .order_by(JobLog.id)
+        )
+        jobs = jobs_res.scalars().all()
+
+        if not jobs:
+            # Log job before raising 404 (billing consistency)
+            gpu = os.getenv("NVIDIA_VISIBLE_DEVICES", "unknown")
+            await log_job(
+                session,
+                endpoint="buyer_merkle_export",
+                payer=payer,
+                cents=settings.PRICE_BALANCE_CENTS,
+                tx_hash=getattr(request.state, "tx_hash", "0xunknown"),
+                latency_ms=int((time.perf_counter() - t0) * 1000),
+                gpu_id=gpu,
+                batch_size=1,
+            )
+            raise HTTPException(status_code=404, detail="no jobs for the given date")
+
+        leaves = [hash_leaf(job_leaf(j)) for j in jobs]
+
+        # Prefer stored MerkleRoot for this payer+date, otherwise compute on-the-fly
+        root_res = await session.execute(
+            select(MerkleRoot).where(
+                MerkleRoot.c.payer == payer,
+                MerkleRoot.c.date == query_date,
+            )
+        )
+        root_row = root_res.fetchone()
+        if root_row:
+            root = root_row["merkle_root"]
+        else:
+            root = compute_merkle_root(leaves)
+
+        # Build jobs array with proofs
+        jobs_out = []
+        for idx, job in enumerate(jobs):
+            leaf_hash = leaves[idx]
+            proof = compute_merkle_proof(leaves, idx)
+            jobs_out.append({
+                "id": job.id,
+                "endpoint": job.endpoint,
+                "cents": job.cents,
+                "tx_hash": job.tx_hash,
+                "created_at": job.created_at.isoformat() if job.created_at else None,
+                "leaf": leaf_hash,
+                "proof": proof,
+            })
+
+        # Defensive self-check: re-verify every leaf proof against the returned root
+        verified = all(
+            verify_merkle_proof(j["leaf"], j["proof"], root) for j in jobs_out
+        )
+
+    dt = time.perf_counter() - t0
+    latency_seconds.labels("buyer_merkle_export").observe(dt)
+
+    # Log successful job
+    async with async_sessionmaker(get_engine(), expire_on_commit=False)() as session:
+        gpu = os.getenv("NVIDIA_VISIBLE_DEVICES", "unknown")
+        await log_job(
+            session,
+            endpoint="buyer_merkle_export",
+            payer=payer,
+            cents=settings.PRICE_BALANCE_CENTS,
+            tx_hash=getattr(request.state, "tx_hash", "0xunknown"),
+            latency_ms=int(dt * 1000),
+            gpu_id=gpu,
+            batch_size=1,
+        )
+
+    return {
+        "ok": True,
+        "version": 1,
+        "date": date,
+        "payer": payer,
+        "root": root,
+        "leaf_count": len(jobs_out),
+        "jobs": jobs_out,
+        "generated_at": datetime.utcnow().isoformat(),
+        "verified": verified,
     }
