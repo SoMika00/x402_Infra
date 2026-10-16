@@ -1,9 +1,10 @@
 import asyncio
 import datetime as dt
+import hashlib
 import typer
 from typing import Optional
 from sqlalchemy.ext.asyncio import async_sessionmaker
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, insert, update
 from app.payments.ledger import get_engine, init_db, Buyer, credit_min_pay, JobLog, MerkleRoot, compute_merkle_root
 
 app = typer.Typer(help="x402 control CLI")
@@ -77,9 +78,9 @@ def joblog_list(
                     str(getattr(r, "created_at", "")),
                     getattr(r, "endpoint", ""),
                     getattr(r, "payer", ""),
-                    str(getattr(r, "cents", ""),
+                    str(getattr(r, "cents", "")),
                     getattr(r, "tx_hash", ""),
-                    str(getattr(r, "latency_ms", ""),
+                    str(getattr(r, "latency_ms", "")),
                     getattr(r, "gpu_id", "") or "",
                 ]
                 typer.echo(" | ".join(vals))
@@ -91,34 +92,84 @@ def joblog_list(
 
 
 @app.command("joblog-merkle")
-def joblog_merkle(date: str):
+def joblog_merkle(
+    date: str,
+    payer: Optional[str] = typer.Option("*", "--payer", help="Filter by payer (default '*' = all payers)"),
+):
     """Compute daily Merkle root for JobLog entries on YYYY-MM-DD."""
     async def _run():
         try:
             d = dt.datetime.strptime(date, "%Y-%m-%d").date()
+            day_start = dt.datetime(d.year, d.month, d.day)
+            day_end = day_start + dt.timedelta(days=1)
+
             async with async_sessionmaker(get_engine(), expire_on_commit=False)() as session:
-                res = await session.execute(
-                    select(JobLog).where(
-                        JobLog.created_at >= dt.datetime(d.year, d.month, d.day),
-                        JobLog.created_at < dt.datetime(d.year, d.month, d.day) + dt.timedelta(days=1)
-                    ).order_by(JobLog.id)
-                )
-                jobs = res.scalars().all()
-                if not jobs:
+                # Determine the set of payers to process
+                if payer == "*":
+                    payers_res = await session.execute(
+                        select(JobLog.payer).where(
+                            JobLog.created_at >= day_start,
+                            JobLog.created_at < day_end,
+                        ).distinct()
+                    )
+                    payers = [row[0] for row in payers_res.all()]
+                else:
+                    payers = [payer]
+
+                if not payers:
                     typer.echo("no jobs")
                     return
-                leaves = []
-                for j in jobs:
-                    # deterministic leaf: id|endpoint|payer|cents|tx_hash
-                    leaf = f"{j.id}|{j.endpoint}|{j.payer}|{j.cents}|{j.tx_hash}"
-                    leaves.append(hashlib.sha256(leaf.encode()).hexdigest())
-                root = compute_merkle_root(leaves)
-                # optionally persist
-                await session.execute(
-                    insert(MerkleRoot).values(date=d, root=root).prefix_with("OR IGNORE")
-                )
+
+                any_jobs = False
+                for p in payers:
+                    res = await session.execute(
+                        select(JobLog).where(
+                            JobLog.payer == p,
+                            JobLog.created_at >= day_start,
+                            JobLog.created_at < day_end,
+                        ).order_by(JobLog.id)
+                    )
+                    jobs = res.scalars().all()
+                    if not jobs:
+                        continue
+                    any_jobs = True
+
+                    leaves = []
+                    for j in jobs:
+                        # deterministic leaf: id|endpoint|payer|cents|tx_hash
+                        leaf = f"{j.id}|{j.endpoint}|{j.payer}|{j.cents}|{j.tx_hash}"
+                        leaves.append(hashlib.sha256(leaf.encode()).hexdigest())
+                    root = compute_merkle_root(leaves)
+
+                    # Portable upsert: select existing row, then update or insert
+                    existing = await session.execute(
+                        select(MerkleRoot).where(
+                            MerkleRoot.payer == p,
+                            MerkleRoot.date == d,
+                        )
+                    )
+                    row = existing.scalar_one_or_none()
+                    if row is not None:
+                        await session.execute(
+                            update(MerkleRoot)
+                            .where(MerkleRoot.payer == p, MerkleRoot.date == d)
+                            .values(merkle_root=root, job_count=len(jobs))
+                        )
+                    else:
+                        await session.execute(
+                            insert(MerkleRoot).values(
+                                payer=p,
+                                date=d,
+                                merkle_root=root,
+                                job_count=len(jobs),
+                            )
+                        )
+                    typer.echo(root)
+
                 await session.commit()
-                typer.echo(root)
+
+                if not any_jobs:
+                    typer.echo("no jobs")
         except Exception as e:
             typer.echo(f"Error: {e}", err=True)
             raise typer.Exit(code=1)
