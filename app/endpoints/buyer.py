@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, Request, HTTPException, Query
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime, timedelta
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy import select
 from app.core.config import settings
@@ -20,6 +21,25 @@ from app.metrics import latency_seconds
 import os, time
 
 router = APIRouter(prefix="/buyer")
+
+
+class ExportJob(BaseModel):
+    id: int
+    endpoint: str
+    payer: str
+    cents: int
+    tx_hash: str
+
+
+class ExportBundle(BaseModel):
+    version: int
+    date: str
+    payer: str
+    root: str
+    leaf_count: int
+    jobs: List[ExportJob]
+    generated_at: Optional[str] = None
+
 
 # Existing buyer endpoints (balance, jobs, summary) are defined elsewhere in this file.
 # For brevity they are not shown here but remain unchanged.
@@ -356,10 +376,6 @@ async def export_merkle(
                 "payer": j.payer,
                 "cents": j.cents,
                 "tx_hash": j.tx_hash,
-                "latency_ms": j.latency_ms,
-                "gpu_id": j.gpu_id,
-                "batch_size": j.batch_size,
-                "created_at": j.created_at.isoformat() if j.created_at else None,
             }
             for j in jobs
         ]
@@ -378,7 +394,7 @@ async def export_merkle(
             tx_hash=getattr(request.state, "tx_hash", "0xunknown"),
             latency_ms=int(dt * 1000),
             gpu_id=gpu,
-            batch_size=1,
+            batch_size=len(jobs),
         )
 
     return {
@@ -389,117 +405,63 @@ async def export_merkle(
         "root": root,
         "leaf_count": len(jobs),
         "jobs": jobs_payload,
-        "generated_at": datetime.utcnow().isoformat(),
+        "generated_at": datetime.utcnow().isoformat() + "Z",
         "verified": True,
     }
 
 
 @router.post("/merkle/export/verify")
-async def verify_export_bundle(request: Request):
-    """Validate a previously exported daily audit bundle.
+async def verify_export_bundle(
+    request: Request,
+    bundle: ExportBundle,
+    _paid=Depends(pay_dep(settings.PRICE_BALANCE_CENTS, endpoint_label="buyer_merkle_export_verify"))
+):
+    """Independently verify a previously exported daily audit bundle.
 
-    This is a pure, stateless verification helper: it does not touch the DB,
-    does not charge the buyer, and does not log a job.
-
-    Accepts a JSON body matching the export bundle shape:
-    {version, date, payer, root, leaf_count, jobs: [{id, endpoint, payer, cents, tx_hash, ...}], generated_at}
-
-    Returns {ok, date, payer, root, leaf_count, root_matches, all_proofs_valid, jobs_checked, failures}.
+    Recomputes the Merkle root from the bundle's jobs and compares it to the
+    declared root, checks leaf_count and payer consistency.
     """
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Request body must be valid JSON")
+    payer = getattr(request.state, "payer", "0xUnknown")
+    t0 = time.perf_counter()
 
-    if not isinstance(body, dict):
-        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+    declared_root = bundle.root
+    leaf_count_matches = bundle.leaf_count == len(bundle.jobs)
+    all_payers_match = all(j.payer == bundle.payer for j in bundle.jobs)
 
-    # Validate required top-level fields
-    required_fields = ["version", "date", "payer", "root", "leaf_count", "jobs"]
-    for field in required_fields:
-        if field not in body:
-            raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+    leaves = [
+        hash_leaf(f"{j.id}|{j.endpoint}|{j.payer}|{j.cents}|{j.tx_hash}")
+        for j in bundle.jobs
+    ]
+    computed_root = compute_merkle_root(leaves)
+    root_matches = computed_root == declared_root
 
-    jobs = body.get("jobs")
-    if not isinstance(jobs, list):
-        raise HTTPException(status_code=400, detail="'jobs' must be a list")
-    if len(jobs) == 0:
-        raise HTTPException(status_code=400, detail="'jobs' must not be empty")
+    verified = root_matches and leaf_count_matches and all_payers_match
 
-    declared_root = body.get("root")
-    if not isinstance(declared_root, str) or not declared_root:
-        raise HTTPException(status_code=400, detail="'root' must be a non-empty string")
+    dt = time.perf_counter() - t0
+    latency_seconds.labels("buyer_merkle_export_verify").observe(dt)
 
-    declared_leaf_count = body.get("leaf_count")
-    if not isinstance(declared_leaf_count, int):
-        raise HTTPException(status_code=400, detail="'leaf_count' must be an integer")
-
-    payer = body.get("payer")
-    if not isinstance(payer, str) or not payer:
-        raise HTTPException(status_code=400, detail="'payer' must be a non-empty string")
-
-    date = body.get("date")
-    if not isinstance(date, str) or not date:
-        raise HTTPException(status_code=400, detail="'date' must be a non-empty string")
-
-    # Validate each job has required fields and shares the bundle payer
-    failures = []
-    ordered_jobs = []
-    for idx, job in enumerate(jobs):
-        if not isinstance(job, dict):
-            raise HTTPException(status_code=400, detail=f"jobs[{idx}] must be an object")
-        for field in ["id", "endpoint", "payer", "cents", "tx_hash"]:
-            if field not in job:
-                raise HTTPException(status_code=400, detail=f"jobs[{idx}] missing required field: {field}")
-        if job.get("payer") != payer:
-            failures.append({
-                "job_id": job.get("id"),
-                "reason": "payer_mismatch",
-                "detail": f"job payer '{job.get('payer')}' does not match bundle payer '{payer}'",
-            })
-        ordered_jobs.append(job)
-
-    # Order jobs by id ascending (matching the export)
-    try:
-        ordered_jobs.sort(key=lambda j: j["id"])
-    except Exception:
-        raise HTTPException(status_code=400, detail="All jobs must have a comparable 'id' field")
-
-    # Recompute leaves using the deterministic leaf format
-    leaves = []
-    for job in ordered_jobs:
-        leaf_str = f"{job['id']}|{job['endpoint']}|{job['payer']}|{job['cents']}|{job['tx_hash']}"
-        leaves.append(hash_leaf(leaf_str))
-
-    recomputed_root = compute_merkle_root(leaves)
-    root_matches = recomputed_root == declared_root
-
-    # Verify each job's Merkle proof against the declared root
-    all_proofs_valid = True
-    for i, job in enumerate(ordered_jobs):
-        leaf_hash = leaves[i]
-        proof = compute_merkle_proof(leaves, i)
-        valid = verify_merkle_proof(leaf_hash, proof, declared_root)
-        if not valid:
-            all_proofs_valid = False
-            failures.append({
-                "job_id": job.get("id"),
-                "reason": "proof_invalid",
-                "detail": "Merkle proof does not verify against declared root",
-            })
-
-    leaf_count_matches = declared_leaf_count == len(jobs)
-
-    ok = root_matches and leaf_count_matches and all_proofs_valid
+    # Log successful job
+    async with async_sessionmaker(get_engine(), expire_on_commit=False)() as session:
+        gpu = os.getenv("NVIDIA_VISIBLE_DEVICES", "unknown")
+        await log_job(
+            session,
+            endpoint="buyer_merkle_export_verify",
+            payer=payer,
+            cents=settings.PRICE_BALANCE_CENTS,
+            tx_hash=getattr(request.state, "tx_hash", "0xunknown"),
+            latency_ms=int(dt * 1000),
+            gpu_id=gpu,
+            batch_size=len(bundle.jobs),
+        )
 
     return {
-        "ok": ok,
-        "date": date,
-        "payer": payer,
-        "root": declared_root,
-        "leaf_count": declared_leaf_count,
+        "ok": True,
+        "date": bundle.date,
+        "payer": bundle.payer,
+        "declared_root": declared_root,
+        "computed_root": computed_root,
         "root_matches": root_matches,
-        "all_proofs_valid": all_proofs_valid,
-        "jobs_checked": len(jobs),
-        "failures": failures,
+        "leaf_count_matches": leaf_count_matches,
+        "all_payers_match": all_payers_match,
+        "verified": verified,
     }
