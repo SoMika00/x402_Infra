@@ -339,11 +339,10 @@ async def export_merkle(
     date: str = Query(..., description="Date in YYYY-MM-DD format"),
     _paid=Depends(pay_dep(settings.PRICE_BALANCE_CENTS, endpoint_label="buyer_merkle_export"))
 ):
-    """Return a self-contained, verifiable daily audit bundle for the authenticated payer.
+    """Export a full audit bundle for a given date for the authenticated buyer.
 
-    Returns {ok, version, date, payer, root, leaf_count, jobs, generated_at, verified}.
+    Returns an ExportBundle (version, date, payer, root, leaf_count, jobs, generated_at).
     """
-    # Validate date format
     try:
         query_date = datetime.strptime(date, "%Y-%m-%d").date()
     except ValueError:
@@ -369,21 +368,31 @@ async def export_merkle(
         leaves = [hash_leaf(job_leaf(j)) for j in jobs]
         root = compute_merkle_root(leaves)
 
-        jobs_payload = [
-            {
-                "id": j.id,
-                "endpoint": j.endpoint,
-                "payer": j.payer,
-                "cents": j.cents,
-                "tx_hash": j.tx_hash,
-            }
+        # Prefer stored MerkleRoot if present
+        root_res = await session.execute(
+            select(MerkleRoot).where(
+                MerkleRoot.c.payer == payer,
+                MerkleRoot.c.date == query_date,
+            )
+        )
+        root_row = root_res.fetchone()
+        if root_row:
+            root = root_row["merkle_root"]
+
+        export_jobs = [
+            ExportJob(
+                id=j.id,
+                endpoint=j.endpoint,
+                payer=j.payer,
+                cents=j.cents,
+                tx_hash=j.tx_hash,
+            )
             for j in jobs
         ]
 
     dt = time.perf_counter() - t0
     latency_seconds.labels("buyer_merkle_export").observe(dt)
 
-    # Log successful job
     async with async_sessionmaker(get_engine(), expire_on_commit=False)() as session:
         gpu = os.getenv("NVIDIA_VISIBLE_DEVICES", "unknown")
         await log_job(
@@ -394,19 +403,17 @@ async def export_merkle(
             tx_hash=getattr(request.state, "tx_hash", "0xunknown"),
             latency_ms=int(dt * 1000),
             gpu_id=gpu,
-            batch_size=len(jobs),
+            batch_size=1,
         )
 
     return {
-        "ok": True,
         "version": 1,
         "date": date,
         "payer": payer,
         "root": root,
         "leaf_count": len(jobs),
-        "jobs": jobs_payload,
+        "jobs": [j.model_dump() for j in export_jobs],
         "generated_at": datetime.utcnow().isoformat() + "Z",
-        "verified": True,
     }
 
 
@@ -416,31 +423,89 @@ async def verify_export_bundle(
     bundle: ExportBundle,
     _paid=Depends(pay_dep(settings.PRICE_BALANCE_CENTS, endpoint_label="buyer_merkle_export_verify"))
 ):
-    """Independently verify a previously exported daily audit bundle.
+    """Re-verify a previously exported audit bundle end-to-end.
 
-    Recomputes the Merkle root from the bundle's jobs and compares it to the
-    declared root, checks leaf_count and payer consistency.
+    Returns {ok, verified, checks: {...}, errors: [...]}.
     """
     payer = getattr(request.state, "payer", "0xUnknown")
     t0 = time.perf_counter()
 
-    declared_root = bundle.root
-    leaf_count_matches = bundle.leaf_count == len(bundle.jobs)
-    all_payers_match = all(j.payer == bundle.payer for j in bundle.jobs)
+    errors: List[str] = []
+    checks: dict = {}
 
-    leaves = [
-        hash_leaf(f"{j.id}|{j.endpoint}|{j.payer}|{j.cents}|{j.tx_hash}")
-        for j in bundle.jobs
-    ]
-    computed_root = compute_merkle_root(leaves)
-    root_matches = computed_root == declared_root
+    # 1. version must equal 1
+    version_ok = bundle.version == 1
+    checks["version"] = version_ok
+    if not version_ok:
+        errors.append(f"version mismatch: expected 1, got {bundle.version}")
 
-    verified = root_matches and leaf_count_matches and all_payers_match
+    # 2. date must parse as YYYY-MM-DD (400 on bad format)
+    try:
+        query_date = datetime.strptime(bundle.date, "%Y-%m-%d").date()
+        checks["date"] = True
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format, expected YYYY-MM-DD")
+
+    # 3. payer must match request.state.payer (403 otherwise)
+    if bundle.payer != payer:
+        raise HTTPException(status_code=403, detail="Bundle payer does not match authenticated payer")
+    checks["payer"] = True
+
+    # 4. Recompute leaves from jobs (order by id ascending)
+    ordered_jobs = sorted(bundle.jobs, key=lambda j: j.id)
+    leaves = [hash_leaf(job_leaf(j)) for j in ordered_jobs]
+    recomputed_root = compute_merkle_root(leaves)
+
+    # 5. Compare recomputed root to bundle.root
+    root_ok = recomputed_root == bundle.root
+    checks["root"] = root_ok
+    if not root_ok:
+        errors.append("root mismatch: recomputed root does not match bundle.root")
+
+    # 6. Compare len(jobs) to bundle.leaf_count
+    leaf_count_ok = len(bundle.jobs) == bundle.leaf_count
+    checks["leaf_count"] = leaf_count_ok
+    if not leaf_count_ok:
+        errors.append(
+            f"leaf_count mismatch: bundle has {len(bundle.jobs)} jobs but leaf_count={bundle.leaf_count}"
+        )
+
+    # 7. Look up stored MerkleRoot for (payer, date)
+    stored_root = None
+    stored_job_count = None
+    async with async_sessionmaker(get_engine(), expire_on_commit=False)() as session:
+        root_res = await session.execute(
+            select(MerkleRoot).where(
+                MerkleRoot.c.payer == payer,
+                MerkleRoot.c.date == query_date,
+            )
+        )
+        root_row = root_res.fetchone()
+        if root_row:
+            stored_root = root_row["merkle_root"]
+            stored_job_count = root_row["job_count"]
+
+    if stored_root is not None:
+        stored_root_ok = bundle.root == stored_root
+        checks["stored_root"] = stored_root_ok
+        if not stored_root_ok:
+            errors.append("stored root mismatch: bundle.root does not match stored MerkleRoot")
+
+        stored_count_ok = bundle.leaf_count == stored_job_count
+        checks["stored_leaf_count"] = stored_count_ok
+        if not stored_count_ok:
+            errors.append(
+                f"stored leaf_count mismatch: bundle.leaf_count={bundle.leaf_count} vs stored job_count={stored_job_count}"
+            )
+    else:
+        checks["stored_root"] = "skipped"
+        checks["stored_leaf_count"] = "skipped"
+
+    verified = len(errors) == 0
 
     dt = time.perf_counter() - t0
     latency_seconds.labels("buyer_merkle_export_verify").observe(dt)
 
-    # Log successful job
     async with async_sessionmaker(get_engine(), expire_on_commit=False)() as session:
         gpu = os.getenv("NVIDIA_VISIBLE_DEVICES", "unknown")
         await log_job(
@@ -451,17 +516,12 @@ async def verify_export_bundle(
             tx_hash=getattr(request.state, "tx_hash", "0xunknown"),
             latency_ms=int(dt * 1000),
             gpu_id=gpu,
-            batch_size=len(bundle.jobs),
+            batch_size=1,
         )
 
     return {
         "ok": True,
-        "date": bundle.date,
-        "payer": bundle.payer,
-        "declared_root": declared_root,
-        "computed_root": computed_root,
-        "root_matches": root_matches,
-        "leaf_count_matches": leaf_count_matches,
-        "all_payers_match": all_payers_match,
         "verified": verified,
+        "checks": checks,
+        "errors": errors,
     }
