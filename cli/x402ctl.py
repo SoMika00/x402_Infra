@@ -1,11 +1,24 @@
 import asyncio
 import datetime as dt
 import hashlib
+import json
 import typer
 from typing import Optional
 from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy import select, desc, insert, update
-from app.payments.ledger import get_engine, init_db, Buyer, credit_min_pay, JobLog, MerkleRoot, compute_merkle_root
+from app.payments.ledger import (
+    get_engine,
+    init_db,
+    Buyer,
+    credit_min_pay,
+    JobLog,
+    MerkleRoot,
+    compute_merkle_root,
+    job_leaf,
+    hash_leaf,
+    compute_merkle_proof,
+    verify_merkle_proof,
+)
 
 app = typer.Typer(help="x402 control CLI")
 
@@ -174,6 +187,86 @@ def joblog_merkle(
             typer.echo(f"Error: {e}", err=True)
             raise typer.Exit(code=1)
     asyncio.run(_run())
+
+
+# --- merkle-verify-bundle ---
+@app.command("merkle-verify-bundle")
+@app.command("merkle_verify_bundle")
+def merkle_verify_bundle(
+    file: str = typer.Argument(..., help="Path to the exported audit bundle JSON file"),
+    job_id: Optional[int] = typer.Option(None, "--job-id", help="Verify inclusion proof for a specific job id"),
+):
+    """Verify an exported audit bundle offline.
+
+    Recomputes each job leaf hash, the Merkle root, and validates
+    leaf_count == len(jobs). Optionally verifies a single job's inclusion
+    proof via --job-id.
+    """
+    try:
+        with open(file, "r", encoding="utf-8") as f:
+            bundle = json.load(f)
+    except Exception as e:
+        typer.echo(f"FAIL: cannot read bundle file: {e}", err=True)
+        raise typer.Exit(code=1)
+
+    # Validate required fields
+    required = ["version", "date", "payer", "root", "leaf_count", "jobs"]
+    missing = [k for k in required if k not in bundle]
+    if missing:
+        typer.echo(f"FAIL: bundle missing required fields: {', '.join(missing)}", err=True)
+        raise typer.Exit(code=1)
+
+    jobs = bundle.get("jobs") or []
+    if not isinstance(jobs, list):
+        typer.echo("FAIL: bundle 'jobs' must be a list", err=True)
+        raise typer.Exit(code=1)
+
+    # (4) leaf_count must match len(jobs)
+    if bundle.get("leaf_count") != len(jobs):
+        typer.echo(
+            f"FAIL: leaf_count mismatch: bundle.leaf_count={bundle.get('leaf_count')} != len(jobs)={len(jobs)}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # (2) recompute each job leaf hash from job fields
+    leaves = []
+    for job in jobs:
+        try:
+            leaf_str = f"{job['id']}|{job['endpoint']}|{job['payer']}|{job['cents']}|{job['tx_hash']}"
+        except KeyError as e:
+            typer.echo(f"FAIL: job missing field {e}", err=True)
+            raise typer.Exit(code=1)
+        leaves.append(hash_leaf(leaf_str))
+
+    # (3) recompute Merkle root and compare
+    computed_root = compute_merkle_root(leaves)
+    if computed_root != bundle.get("root"):
+        typer.echo(
+            f"FAIL: root mismatch: computed={computed_root} != bundle.root={bundle.get('root')}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # (5) optional single job inclusion proof
+    if job_id is not None:
+        target_index = None
+        for i, job in enumerate(jobs):
+            if job.get("id") == job_id:
+                target_index = i
+                break
+        if target_index is None:
+            typer.echo(f"FAIL: job_id {job_id} not found in bundle", err=True)
+            raise typer.Exit(code=1)
+
+        leaf_hash = leaves[target_index]
+        proof = compute_merkle_proof(leaves, target_index)
+        verified = verify_merkle_proof(leaf_hash, proof, computed_root)
+        typer.echo(f"job_id={job_id} verified={str(verified).lower()}")
+        if not verified:
+            raise typer.Exit(code=1)
+
+    typer.echo("OK")
 
 
 if __name__ == "__main__":
