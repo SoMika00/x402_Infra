@@ -363,16 +363,15 @@ async def export_merkle(
         jobs = jobs_res.scalars().all()
 
         jobs_out = [
-            {
-                "id": j.id,
-                "endpoint": j.endpoint,
-                "payer": j.payer,
-                "cents": j.cents,
-                "tx_hash": j.tx_hash,
-            }
+            ExportJob(
+                id=j.id,
+                endpoint=j.endpoint,
+                payer=j.payer,
+                cents=j.cents,
+                tx_hash=j.tx_hash,
+            )
             for j in jobs
         ]
-
         leaves = [hash_leaf(job_leaf(j)) for j in jobs]
         root = compute_merkle_root(leaves)
 
@@ -389,17 +388,16 @@ async def export_merkle(
             tx_hash=getattr(request.state, "tx_hash", "0xunknown"),
             latency_ms=int(dt * 1000),
             gpu_id=gpu,
-            batch_size=len(jobs_out),
+            batch_size=1,
         )
 
     return {
         "ok": True,
-        "version": 1,
         "date": date,
         "payer": payer,
         "root": root,
         "leaf_count": len(jobs_out),
-        "jobs": jobs_out,
+        "jobs": [j.model_dump() for j in jobs_out],
         "generated_at": datetime.utcnow().isoformat(),
     }
 
@@ -408,58 +406,56 @@ async def export_merkle(
 async def verify_export_bundle(
     request: Request,
     bundle: ExportBundle,
-    job_id: Optional[int] = Query(None, description="Job id to verify inclusion proof for"),
+    job_id: Optional[int] = Query(None, description="Optional job id to verify inclusion proof"),
     _paid=Depends(pay_dep(settings.PRICE_BALANCE_CENTS, endpoint_label="buyer_merkle_export_verify"))
 ):
-    """Validate an exported audit bundle server-side.
+    """Verify an exported audit bundle offline-style.
 
     Recomputes each job leaf hash, the Merkle root, and validates
     leaf_count == len(jobs). Optionally verifies a single job's inclusion
-    proof via ?job_id=N.
+    proof via ?job_id=. Returns 200 with ok=false on validation failure.
     """
     payer = getattr(request.state, "payer", "0xUnknown")
     t0 = time.perf_counter()
 
-    # (1) required fields are enforced by pydantic model; validate leaf_count
-    jobs = bundle.jobs
-    if bundle.leaf_count != len(jobs):
-        raise HTTPException(status_code=400, detail="leaf_count does not match len(jobs)")
+    errors: List[str] = []
+    leaf_count_match = bundle.leaf_count == len(bundle.jobs)
+    if not leaf_count_match:
+        errors.append(
+            f"leaf_count mismatch: bundle.leaf_count={bundle.leaf_count} != len(jobs)={len(bundle.jobs)}"
+        )
 
-    # (3) recompute each leaf
-    leaves = []
-    for job in jobs:
+    # Recompute each job leaf hash from job fields
+    leaves: List[str] = []
+    for job in bundle.jobs:
         leaf_str = f"{job.id}|{job.endpoint}|{job.payer}|{job.cents}|{job.tx_hash}"
         leaves.append(hash_leaf(leaf_str))
 
-    # (4) recompute root and compare
     computed_root = compute_merkle_root(leaves)
     root_match = computed_root == bundle.root
+    if not root_match:
+        errors.append(
+            f"root mismatch: computed={computed_root} != bundle.root={bundle.root}"
+        )
 
-    result = {
-        "ok": True,
-        "valid": root_match,
-        "date": bundle.date,
-        "payer": bundle.payer,
-        "leaf_count": bundle.leaf_count,
-        "computed_root": computed_root,
-        "root_match": root_match,
-    }
-
-    # (5) optional single job inclusion proof
+    job_verified: Optional[bool] = None
     if job_id is not None:
         target_index = None
-        for i, job in enumerate(jobs):
+        for i, job in enumerate(bundle.jobs):
             if job.id == job_id:
                 target_index = i
                 break
         if target_index is None:
-            raise HTTPException(status_code=400, detail=f"job_id {job_id} not found in bundle")
+            job_verified = False
+            errors.append(f"job_id {job_id} not found in bundle")
+        else:
+            leaf_hash = leaves[target_index]
+            proof = compute_merkle_proof(leaves, target_index)
+            job_verified = verify_merkle_proof(leaf_hash, proof, computed_root)
+            if not job_verified:
+                errors.append(f"job_id {job_id} inclusion proof failed")
 
-        leaf_hash = leaves[target_index]
-        proof = compute_merkle_proof(leaves, target_index)
-        verified = verify_merkle_proof(leaf_hash, proof, computed_root)
-        result["job_id"] = job_id
-        result["verified"] = verified
+    ok = bool(leaf_count_match and root_match and (job_verified is None or job_verified))
 
     dt = time.perf_counter() - t0
     latency_seconds.labels("buyer_merkle_export_verify").observe(dt)
@@ -474,7 +470,16 @@ async def verify_export_bundle(
             tx_hash=getattr(request.state, "tx_hash", "0xunknown"),
             latency_ms=int(dt * 1000),
             gpu_id=gpu,
-            batch_size=len(jobs),
+            batch_size=1,
         )
 
-    return result
+    return {
+        "ok": ok,
+        "date": bundle.date,
+        "payer": bundle.payer,
+        "leaf_count": bundle.leaf_count,
+        "root_match": root_match,
+        "leaf_count_match": leaf_count_match,
+        "job_verified": job_verified,
+        "errors": errors,
+    }
