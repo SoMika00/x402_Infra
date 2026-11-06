@@ -339,7 +339,7 @@ async def export_merkle(
     date: str = Query(..., description="Date in YYYY-MM-DD format"),
     _paid=Depends(pay_dep(settings.PRICE_BALANCE_CENTS, endpoint_label="buyer_merkle_export"))
 ):
-    """Export an audit bundle for a given date for the authenticated buyer."""
+    """Export a daily audit bundle (JSON) for the authenticated payer."""
     try:
         query_date = datetime.strptime(date, "%Y-%m-%d").date()
     except ValueError:
@@ -363,15 +363,16 @@ async def export_merkle(
         jobs = jobs_res.scalars().all()
 
         jobs_out = [
-            ExportJob(
-                id=j.id,
-                endpoint=j.endpoint,
-                payer=j.payer,
-                cents=j.cents,
-                tx_hash=j.tx_hash,
-            )
+            {
+                "id": j.id,
+                "endpoint": j.endpoint,
+                "payer": j.payer,
+                "cents": j.cents,
+                "tx_hash": j.tx_hash,
+            }
             for j in jobs
         ]
+
         leaves = [hash_leaf(job_leaf(j)) for j in jobs]
         root = compute_merkle_root(leaves)
 
@@ -388,78 +389,98 @@ async def export_merkle(
             tx_hash=getattr(request.state, "tx_hash", "0xunknown"),
             latency_ms=int(dt * 1000),
             gpu_id=gpu,
-            batch_size=1,
+            batch_size=len(jobs_out),
         )
 
     return {
         "ok": True,
+        "version": 1,
         "date": date,
         "payer": payer,
         "root": root,
         "leaf_count": len(jobs_out),
-        "jobs": [j.model_dump() for j in jobs_out],
-        "generated_at": datetime.utcnow().isoformat(),
+        "jobs": jobs_out,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
     }
 
 
 @router.post("/merkle/export/verify")
 async def verify_export_bundle(
     request: Request,
-    bundle: ExportBundle,
-    job_id: Optional[int] = Query(None, description="Optional job id to verify inclusion proof"),
+    body: ExportBundle,
+    job_id: Optional[int] = Query(None, description="Optional JobLog id to verify inclusion proof"),
     _paid=Depends(pay_dep(settings.PRICE_BALANCE_CENTS, endpoint_label="buyer_merkle_export_verify"))
 ):
-    """Verify an exported audit bundle offline-style.
+    """Validate an exported daily audit bundle (the JSON produced by /buyer/merkle/export).
 
-    Recomputes each job leaf hash, the Merkle root, and validates
-    leaf_count == len(jobs). Optionally verifies a single job's inclusion
-    proof via ?job_id=. Returns 200 with ok=false on validation failure.
+    Recomputes each job leaf hash and the Merkle root, validates leaf_count == len(jobs),
+    and optionally verifies a single job's inclusion proof via ?job_id.
+
+    Returns HTTP 200 even when the bundle is invalid (valid=false) so callers can inspect
+    errors; only malformed input (missing required fields / non-list jobs) yields 4xx.
     """
     payer = getattr(request.state, "payer", "0xUnknown")
     t0 = time.perf_counter()
 
     errors: List[str] = []
-    leaf_count_match = bundle.leaf_count == len(bundle.jobs)
+    leaf_count_match = body.leaf_count == len(body.jobs)
     if not leaf_count_match:
-        errors.append(
-            f"leaf_count mismatch: bundle.leaf_count={bundle.leaf_count} != len(jobs)={len(bundle.jobs)}"
-        )
+        errors.append("leaf_count_mismatch")
 
-    # Recompute each job leaf hash from job fields
+    # Recompute each leaf hash from job fields
     leaves: List[str] = []
-    for job in bundle.jobs:
+    for job in body.jobs:
         leaf_str = f"{job.id}|{job.endpoint}|{job.payer}|{job.cents}|{job.tx_hash}"
         leaves.append(hash_leaf(leaf_str))
 
     computed_root = compute_merkle_root(leaves)
-    root_match = computed_root == bundle.root
+    root_match = computed_root == body.root
     if not root_match:
-        errors.append(
-            f"root mismatch: computed={computed_root} != bundle.root={bundle.root}"
-        )
+        errors.append("root_mismatch")
 
-    job_verified: Optional[bool] = None
+    valid = leaf_count_match and root_match
+
+    response = {
+        "ok": True,
+        "valid": valid,
+        "date": body.date,
+        "payer": body.payer,
+        "leaf_count": body.leaf_count,
+        "computed_root": computed_root,
+        "root_match": root_match,
+        "leaf_count_match": leaf_count_match,
+        "errors": errors,
+    }
+
+    # Optional single job inclusion proof
     if job_id is not None:
         target_index = None
-        for i, job in enumerate(bundle.jobs):
+        for i, job in enumerate(body.jobs):
             if job.id == job_id:
                 target_index = i
                 break
+
         if target_index is None:
-            job_verified = False
+            response["job_id"] = job_id
+            response["job_verified"] = False
             errors.append(f"job_id {job_id} not found in bundle")
+            response["errors"] = errors
+            response["valid"] = False
         else:
             leaf_hash = leaves[target_index]
             proof = compute_merkle_proof(leaves, target_index)
             job_verified = verify_merkle_proof(leaf_hash, proof, computed_root)
+            response["job_id"] = job_id
+            response["job_verified"] = job_verified
             if not job_verified:
-                errors.append(f"job_id {job_id} inclusion proof failed")
-
-    ok = bool(leaf_count_match and root_match and (job_verified is None or job_verified))
+                errors.append("job_verification_failed")
+                response["errors"] = errors
+                response["valid"] = False
 
     dt = time.perf_counter() - t0
     latency_seconds.labels("buyer_merkle_export_verify").observe(dt)
 
+    # Log successful job
     async with async_sessionmaker(get_engine(), expire_on_commit=False)() as session:
         gpu = os.getenv("NVIDIA_VISIBLE_DEVICES", "unknown")
         await log_job(
@@ -470,16 +491,7 @@ async def verify_export_bundle(
             tx_hash=getattr(request.state, "tx_hash", "0xunknown"),
             latency_ms=int(dt * 1000),
             gpu_id=gpu,
-            batch_size=1,
+            batch_size=len(body.jobs),
         )
 
-    return {
-        "ok": ok,
-        "date": bundle.date,
-        "payer": bundle.payer,
-        "leaf_count": bundle.leaf_count,
-        "root_match": root_match,
-        "leaf_count_match": leaf_count_match,
-        "job_verified": job_verified,
-        "errors": errors,
-    }
+    return response
