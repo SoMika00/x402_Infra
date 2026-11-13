@@ -350,60 +350,42 @@ async def verify_export_bundle(
     body: ExportVerifyRequest,
     _paid=Depends(pay_dep(settings.PRICE_BALANCE_CENTS, endpoint_label="buyer_merkle_export_verify"))
 ):
-    """Re-validate an exported audit bundle server-side.
+    """Validate a previously exported audit bundle server-side.
 
-    Accepts the JSON produced by /buyer/merkle/export and re-computes each
-    leaf hash, the Merkle root, and (optionally) a single job's inclusion
-    proof. Returns structured diagnostics with HTTP 200 even when validation
-    fails (400 is reserved for malformed bodies).
+    Recomputes each job leaf hash, the Merkle root, and validates
+    leaf_count == len(jobs). Optionally verifies a single job's inclusion
+    proof via job_id.
     """
     payer = getattr(request.state, "payer", "0xUnknown")
     t0 = time.perf_counter()
 
+    errors = []
+
+    # (1) required fields present (pydantic already enforces presence, but
+    #     validate jobs is a non-empty list and leaf_count consistency)
     jobs = body.jobs or []
 
-    # 1. leaf_count must equal len(jobs)
-    leaf_count_match = body.leaf_count == len(jobs)
-    if not leaf_count_match:
-        result = {
-            "ok": False,
-            "date": body.date,
-            "payer": body.payer,
-            "leaf_count": body.leaf_count,
-            "root_match": False,
-            "leaf_count_match": False,
-            "job_verified": None,
-            "reason": f"leaf_count mismatch: leaf_count={body.leaf_count} != len(jobs)={len(jobs)}",
-        }
-        dt = time.perf_counter() - t0
-        latency_seconds.labels("buyer_merkle_export_verify").observe(dt)
-        async with async_sessionmaker(get_engine(), expire_on_commit=False)() as session:
-            gpu = os.getenv("NVIDIA_VISIBLE_DEVICES", "unknown")
-            await log_job(
-                session,
-                endpoint="buyer_merkle_export_verify",
-                payer=payer,
-                cents=settings.PRICE_BALANCE_CENTS,
-                tx_hash=getattr(request.state, "tx_hash", "0xunknown"),
-                latency_ms=int(dt * 1000),
-                gpu_id=gpu,
-                batch_size=len(jobs),
-            )
-        return result
+    # (4) leaf_count must match len(jobs)
+    if body.leaf_count != len(jobs):
+        errors.append(
+            f"leaf_count mismatch: bundle.leaf_count={body.leaf_count} != len(jobs)={len(jobs)}"
+        )
 
-    # 2. Recompute each leaf via job_leaf-style formatting
+    # (2) recompute each job leaf hash from job fields
     leaves = []
     for job in jobs:
         leaf_str = f"{job.id}|{job.endpoint}|{job.payer}|{job.cents}|{job.tx_hash}"
         leaves.append(hash_leaf(leaf_str))
 
-    # 3. Recompute root and compare
+    # (3) recompute Merkle root and compare
     computed_root = compute_merkle_root(leaves)
-    root_match = computed_root == body.root
+    if computed_root != body.root:
+        errors.append(
+            f"root mismatch: computed={computed_root} != bundle.root={body.root}"
+        )
 
-    # 4. Optional job_id inclusion proof
-    job_verified = None
-    reason = None
+    # (5) optional single job inclusion proof
+    verified_job = None
     if body.job_id is not None:
         target_index = None
         for i, job in enumerate(jobs):
@@ -411,33 +393,18 @@ async def verify_export_bundle(
                 target_index = i
                 break
         if target_index is None:
-            job_verified = False
-            reason = f"job_id {body.job_id} not found in bundle"
+            errors.append(f"job_id {body.job_id} not found in bundle")
         else:
             leaf_hash = leaves[target_index]
             proof = compute_merkle_proof(leaves, target_index)
-            job_verified = verify_merkle_proof(leaf_hash, proof, computed_root)
-            if not job_verified:
-                reason = f"job_id {body.job_id} inclusion proof failed"
+            verified_job = verify_merkle_proof(leaf_hash, proof, computed_root)
 
-    ok = leaf_count_match and root_match and (job_verified is not False)
-    if not root_match and reason is None:
-        reason = f"root mismatch: computed={computed_root} != bundle.root={body.root}"
-
-    result = {
-        "ok": ok,
-        "date": body.date,
-        "payer": body.payer,
-        "leaf_count": body.leaf_count,
-        "root_match": root_match,
-        "leaf_count_match": leaf_count_match,
-        "job_verified": job_verified,
-        "reason": reason,
-    }
+    verified = len(errors) == 0
 
     dt = time.perf_counter() - t0
     latency_seconds.labels("buyer_merkle_export_verify").observe(dt)
 
+    # Log the job
     async with async_sessionmaker(get_engine(), expire_on_commit=False)() as session:
         gpu = os.getenv("NVIDIA_VISIBLE_DEVICES", "unknown")
         await log_job(
@@ -451,4 +418,18 @@ async def verify_export_bundle(
             batch_size=len(jobs),
         )
 
-    return result
+    if not verified:
+        raise HTTPException(
+            status_code=400,
+            detail={"ok": False, "errors": errors},
+        )
+
+    return {
+        "ok": True,
+        "verified": True,
+        "root": body.root,
+        "leaf_count": body.leaf_count,
+        "job_id": body.job_id,
+        "verified_job": verified_job,
+        "errors": [],
+    }
