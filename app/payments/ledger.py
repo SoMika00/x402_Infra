@@ -110,6 +110,57 @@ async def get_job_summary(session: AsyncSession, payer: str) -> dict:
     }
 
 
+async def get_daily_stats(session: AsyncSession, day: dt.date) -> dict:
+    """Aggregate platform-wide daily job statistics for a given UTC day.
+
+    Returns a dict with total_jobs, total_cents, unique_payers, per-endpoint
+    breakdown, and first/last job timestamps. All values are zeroed/empty when
+    there are no jobs for the day.
+    """
+    day_start = dt.datetime(day.year, day.month, day.day)
+    day_end = day_start + dt.timedelta(days=1)
+
+    # Per-endpoint breakdown
+    per_endpoint_q = (
+        select(
+            JobLog.endpoint,
+            func.count(),
+            func.sum(JobLog.cents),
+        )
+        .where(JobLog.created_at >= day_start, JobLog.created_at < day_end)
+        .group_by(JobLog.endpoint)
+        .order_by(JobLog.endpoint)
+    )
+    per_endpoint_res = await session.execute(per_endpoint_q)
+    endpoints = [
+        {"endpoint": endpoint, "jobs": count or 0, "cents": cents or 0}
+        for endpoint, count, cents in per_endpoint_res.all()
+    ]
+
+    # Overall aggregates
+    overall_q = (
+        select(
+            func.count(),
+            func.sum(JobLog.cents),
+            func.count(func.distinct(JobLog.payer)),
+            func.min(JobLog.created_at),
+            func.max(JobLog.created_at),
+        )
+        .where(JobLog.created_at >= day_start, JobLog.created_at < day_end)
+    )
+    overall_res = await session.execute(overall_q)
+    total_jobs, total_cents, unique_payers, first_at, last_at = overall_res.one()
+
+    return {
+        "total_jobs": total_jobs or 0,
+        "total_cents": total_cents or 0,
+        "unique_payers": unique_payers or 0,
+        "endpoints": endpoints,
+        "first_job_at": first_at.isoformat() if first_at else None,
+        "last_job_at": last_at.isoformat() if last_at else None,
+    }
+
+
 def job_leaf(job) -> str:
     """Deterministic leaf string for a JobLog row: id|endpoint|payer|cents|tx_hash."""
     return f"{job.id}|{job.endpoint}|{job.payer}|{job.cents}|{job.tx_hash}"
