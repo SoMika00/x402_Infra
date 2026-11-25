@@ -121,6 +121,115 @@ async def get_merkle(
     }
 
 
+@router.get("/merkle/export")
+async def export_merkle(
+    request: Request,
+    date: str = Query(..., description="Date in YYYY-MM-DD format"),
+    _paid=Depends(pay_dep(settings.PRICE_BALANCE_CENTS, endpoint_label="buyer_merkle_export"))
+):
+    """Export a self-contained, offline-verifiable daily audit bundle for a UTC day.
+
+    Returns a JSON bundle matching the ExportBundle model, compatible with
+    /buyer/merkle/export/verify and the merkle-verify-bundle CLI.
+    """
+    # Validate date format
+    try:
+        query_date = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format, expected YYYY-MM-DD")
+
+    payer = getattr(request.state, "payer", "0xUnknown")
+    t0 = time.perf_counter()
+
+    async with async_sessionmaker(get_engine(), expire_on_commit=False)() as session:
+        # Load the payer's JobLog rows for that UTC day ordered by JobLog.id
+        day_start = datetime(query_date.year, query_date.month, query_date.day)
+        day_end = day_start + timedelta(days=1)
+        jobs_res = await session.execute(
+            select(JobLog)
+            .where(
+                JobLog.payer == payer,
+                JobLog.created_at >= day_start,
+                JobLog.created_at < day_end,
+            )
+            .order_by(JobLog.id)
+        )
+        jobs = jobs_res.scalars().all()
+
+        if not jobs:
+            gpu = os.getenv("NVIDIA_VISIBLE_DEVICES", "unknown")
+            await log_job(
+                session,
+                endpoint="buyer_merkle_export",
+                payer=payer,
+                cents=settings.PRICE_BALANCE_CENTS,
+                tx_hash=getattr(request.state, "tx_hash", "0xunknown"),
+                latency_ms=int((time.perf_counter() - t0) * 1000),
+                gpu_id=gpu,
+                batch_size=1,
+            )
+            raise HTTPException(status_code=404, detail="No jobs found for the given date")
+
+        # Build leaves via hash_leaf(job_leaf(j))
+        leaves = [hash_leaf(job_leaf(j)) for j in jobs]
+
+        # Prefer persisted MerkleRoot row; otherwise compute on the fly
+        root_res = await session.execute(
+            select(MerkleRoot).where(
+                MerkleRoot.c.payer == payer,
+                MerkleRoot.c.date == query_date,
+            )
+        )
+        root_row = root_res.fetchone()
+        if root_row:
+            root = root_row["merkle_root"]
+            root_source = "stored"
+        else:
+            root = compute_merkle_root(leaves)
+            root_source = "computed"
+
+        generated_at = datetime.utcnow().isoformat() + "Z"
+
+        bundle = {
+            "version": 1,
+            "date": date,
+            "payer": payer,
+            "root": root,
+            "leaf_count": len(jobs),
+            "jobs": [
+                {
+                    "id": j.id,
+                    "endpoint": j.endpoint,
+                    "payer": j.payer,
+                    "cents": j.cents,
+                    "tx_hash": j.tx_hash,
+                }
+                for j in jobs
+            ],
+            "generated_at": generated_at,
+            "root_source": root_source,
+        }
+
+    dt = time.perf_counter() - t0
+    latency_seconds.labels("buyer_merkle_export").observe(dt)
+
+    # Log successful job
+    async with async_sessionmaker(get_engine(), expire_on_commit=False)() as session:
+        gpu = os.getenv("NVIDIA_VISIBLE_DEVICES", "unknown")
+        await log_job(
+            session,
+            endpoint="buyer_merkle_export",
+            payer=payer,
+            cents=settings.PRICE_BALANCE_CENTS,
+            tx_hash=getattr(request.state, "tx_hash", "0xunknown"),
+            latency_ms=int(dt * 1000),
+            gpu_id=gpu,
+            batch_size=1,
+        )
+
+    return bundle
+
+
 @router.get("/merkle/verify")
 async def verify_merkle(
     request: Request,
@@ -342,92 +451,3 @@ async def get_merkle_proof(
         "proof": proof,
         "root": root,
     }
-
-
-@router.post("/merkle/export/verify")
-async def verify_export_bundle(
-    request: Request,
-    body: ExportVerifyRequest,
-    _paid=Depends(pay_dep(settings.PRICE_BALANCE_CENTS, endpoint_label="buyer_merkle_export_verify"))
-):
-    """Independently re-validate an exported audit bundle.
-
-    Recomputes each job leaf hash, the Merkle root, and validates
-    leaf_count == len(jobs). Optionally proves a single job's inclusion
-    via ``job_id``.
-    """
-    payer = getattr(request.state, "payer", "0xUnknown")
-    t0 = time.perf_counter()
-
-    jobs = body.jobs
-
-    # (1) leaf_count must match len(jobs)
-    if body.leaf_count != len(jobs):
-        raise HTTPException(
-            status_code=400,
-            detail=f"leaf_count mismatch: leaf_count={body.leaf_count} != len(jobs)={len(jobs)}",
-        )
-
-    # (2) recompute each job leaf hash from job fields
-    leaves = []
-    for job in jobs:
-        try:
-            leaf_str = f"{job.id}|{job.endpoint}|{job.payer}|{job.cents}|{job.tx_hash}"
-        except Exception:
-            raise HTTPException(status_code=400, detail="job missing required field")
-        leaves.append(hash_leaf(leaf_str))
-
-    # (3) recompute Merkle root and compare
-    computed_root = compute_merkle_root(leaves)
-    provided_root = body.root
-
-    response = {
-        "ok": True,
-        "verified": computed_root == provided_root,
-        "date": body.date,
-        "payer": body.payer,
-        "leaf_count": body.leaf_count,
-        "computed_root": computed_root,
-        "provided_root": provided_root,
-    }
-
-    if computed_root != provided_root:
-        response["ok"] = False
-        response["reason"] = "root_mismatch"
-    else:
-        # (4) optional single job inclusion proof
-        if body.job_id is not None:
-            target_index = None
-            for i, job in enumerate(jobs):
-                if job.id == body.job_id:
-                    target_index = i
-                    break
-            if target_index is None:
-                raise HTTPException(status_code=404, detail=f"job_id {body.job_id} not found in bundle")
-
-            leaf_hash = leaves[target_index]
-            proof = compute_merkle_proof(leaves, target_index)
-            verified_inclusion = verify_merkle_proof(leaf_hash, proof, computed_root)
-            response["job_id"] = body.job_id
-            response["leaf"] = leaf_hash
-            response["proof"] = proof
-            response["verified_inclusion"] = verified_inclusion
-
-    dt = time.perf_counter() - t0
-    latency_seconds.labels("buyer_merkle_export_verify").observe(dt)
-
-    # Log job
-    async with async_sessionmaker(get_engine(), expire_on_commit=False)() as session:
-        gpu = os.getenv("NVIDIA_VISIBLE_DEVICES", "unknown")
-        await log_job(
-            session,
-            endpoint="buyer_merkle_export_verify",
-            payer=payer,
-            cents=settings.PRICE_BALANCE_CENTS,
-            tx_hash=getattr(request.state, "tx_hash", "0xunknown"),
-            latency_ms=int(dt * 1000),
-            gpu_id=gpu,
-            batch_size=1,
-        )
-
-    return response
